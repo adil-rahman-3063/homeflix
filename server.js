@@ -169,6 +169,47 @@ function trackLabel(s, fallback) {
   return s.codec_type === 'audio' ? name + channels : name;
 }
 
+function parseDuration(val) {
+  if (!val) return 0;
+  if (typeof val === 'number') return Number.isFinite(val) && val > 0 ? val : 0;
+  const n = Number(val);
+  if (Number.isFinite(n) && n > 0) return n;
+  const m = String(val).match(/^(\d+):(\d+):(\d+(?:\.\d+)?)$/);
+  if (m) {
+    const sec = parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseFloat(m[3]);
+    return Number.isFinite(sec) && sec > 0 ? sec : 0;
+  }
+  return 0;
+}
+
+function extractDuration(data, video, audio) {
+  let dur = parseDuration(data.format && data.format.duration);
+  if (dur > 0) return dur;
+  const durFromTags = (tags) => {
+    if (!tags) return 0;
+    for (const [k, v] of Object.entries(tags)) {
+      if (/^DURATION/i.test(k)) {
+        const d = parseDuration(v);
+        if (d > 0) return d;
+      }
+    }
+    return 0;
+  };
+  if (video) {
+    dur = parseDuration(video.duration) || durFromTags(video.tags);
+    if (dur > 0) return dur;
+  }
+  if (audio) {
+    dur = parseDuration(audio.duration) || durFromTags(audio.tags);
+    if (dur > 0) return dur;
+  }
+  if (data.format && data.format.tags) {
+    dur = durFromTags(data.format.tags);
+    if (dur > 0) return dur;
+  }
+  return 0;
+}
+
 function probe(item) {
   const key = `${item.id}-${item.size}-${item.mtime}`; // re-probe once a download grows
   if (!probes.has(key)) {
@@ -188,7 +229,7 @@ function probe(item) {
         .map((s, i) => ({ key: `e${s.index}`, stream: s.index, n: i, lang: (s.tags && s.tags.language) || 'und', label: trackLabel(s, `Subtitles ${i + 1}`) }));
       for (const side of sidecarSubs(item.path)) subs.push(side);
       return {
-        duration: Number(data.format && data.format.duration) || 0,
+        duration: extractDuration(data, video, audio),
         video,
         audio,
         audios,

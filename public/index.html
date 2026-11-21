@@ -290,9 +290,28 @@ const store = {
   get(id) { try { return JSON.parse(localStorage.getItem('pos:' + id)) || null; } catch { return null; } },
   set(id, v) { try { localStorage.setItem('pos:' + id, JSON.stringify(v)); } catch {} },
 };
-const pct = (id) => { const p = store.get(id); return p && p.duration ? Math.min(100, (p.time / p.duration) * 100) : 0; };
-const inProgress = (id) => { const p = store.get(id); return p && p.time > 30 && p.time < p.duration - 120; };
-const finished = (id) => { const p = store.get(id); return p && p.duration && p.time >= p.duration - 120; };
+const getDur = (id, fallback) => {
+  const m = movies.find((x) => x.id === id);
+  return (m && m.duration) || fallback || 0;
+};
+const pct = (id) => {
+  const p = store.get(id);
+  if (!p || !p.time) return 0;
+  const d = getDur(id, p.duration);
+  return d ? Math.min(100, (p.time / d) * 100) : 0;
+};
+const inProgress = (id) => {
+  const p = store.get(id);
+  if (!p || !p.time) return false;
+  const d = getDur(id, p.duration);
+  return d ? (p.time > 30 && p.time < d - 120) : (p.time > 30);
+};
+const finished = (id) => {
+  const p = store.get(id);
+  if (!p || !p.time) return false;
+  const d = getDur(id, p.duration);
+  return d ? p.time >= d - 120 : false;
+};
 
 // ---------- helpers ----------
 function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]); }
@@ -300,7 +319,15 @@ function fmtSize(b) { return b > 1e9 ? (b / 1e9).toFixed(1) + ' GB' : Math.round
 function fmtTime(s) { s = Math.floor(s); const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60; return h ? `${h}h ${m}m` : `${m}m`; }
 function isNew(m) { return Date.now() - m.mtime < 7 * 864e5; }
 async function info(id) {
-  if (!infoCache[id]) infoCache[id] = fetch('/api/info/' + id).then((r) => r.json());
+  if (!infoCache[id]) {
+    infoCache[id] = fetch('/api/info/' + id).then((r) => r.json()).then((data) => {
+      if (data && data.duration) {
+        const m = movies.find((x) => x.id === id);
+        if (m) m.duration = data.duration;
+      }
+      return data;
+    });
+  }
   return infoCache[id];
 }
 
@@ -665,9 +692,22 @@ async function switchAudio(n) {
 }
 
 function fmtClock(s) {
-  s = Math.max(0, Math.floor(s || 0));
+  if (!Number.isFinite(s) || s < 0) return '0:00';
+  s = Math.floor(s);
   const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, sec = String(s % 60).padStart(2, '0');
   return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
+}
+
+function totalDuration(p = player) {
+  if (!p) return 0;
+  const idur = Number(p.i && p.i.duration);
+  const vdur = Number(p.v && p.v.duration);
+  const validI = Number.isFinite(idur) && idur > 0;
+  const validV = Number.isFinite(vdur) && vdur > 0;
+  if (validI && validV) return Math.max(idur, vdur);
+  if (validI) return idur;
+  if (validV) return vdur;
+  return 0;
 }
 
 function osdHtml(i, m, kind, audio = 0) {
@@ -694,6 +734,8 @@ function teardownVideo() {
   player.timers.forEach(clearTimeout);
   if (player.hls) player.hls.destroy();
   if (player.boost) player.boost.src.disconnect();
+  seekTarget = null;
+  clearTimeout(seekClearTimer);
   const v = player.v;
   v.pause();
   v.removeAttribute('src');
@@ -735,7 +777,8 @@ function play(i, m, kind, startAt, audio = 0) {
   const p = (player = { v, i, m, kind, audio, hls: null, timers: [] });
   const watch = $('watch');
   const saved = store.get(i.id);
-  const resumeAt = startAt != null ? startAt : saved && saved.time > 30 && saved.time < saved.duration - 120 ? saved.time : 0;
+  const totalDur = (i && i.duration) || (saved && saved.duration) || 0;
+  const resumeAt = startAt != null ? startAt : saved && saved.time > 30 && (totalDur ? saved.time < totalDur - 120 : true) ? saved.time : 0;
 
   if (kind === 'hls' && !nativeHls()) {
     loadHlsLib().then((Hls) => {
@@ -755,7 +798,15 @@ function play(i, m, kind, startAt, audio = 0) {
     }).catch(() => showPlayError('Couldn’t load the player. Check that the computer or phone running HOMEFLIX is awake and on the Wi-Fi.'));
   } else {
     v.src = withKey(kind === 'hls' ? `/hls/${i.id}/${audio}/index.m3u8` : `/video/${i.id}${audioQuery(audio)}`);
-    if (resumeAt) v.addEventListener('loadedmetadata', () => { v.currentTime = resumeAt; }, { once: true });
+    if (resumeAt) {
+      const applyResume = () => {
+        if (Math.abs(v.currentTime - resumeAt) > 1) {
+          try { v.currentTime = resumeAt; } catch {}
+        }
+      };
+      v.addEventListener('loadedmetadata', applyResume, { once: true });
+      v.addEventListener('canplay', applyResume, { once: true });
+    }
   }
 
   // "Converting…" / "Loading…" only when a wait lasts long enough to notice.
@@ -767,7 +818,10 @@ function play(i, m, kind, startAt, audio = 0) {
 
   let last = 0;
   // Skip once the player is torn down (no duration), or leaving would reset the position to 0.
-  const save = () => { if (v.duration && v.currentTime) store.set(i.id, { time: v.currentTime, duration: v.duration, at: Date.now() }); };
+  const save = () => {
+    const d = totalDuration(p);
+    if (d && v.currentTime) store.set(i.id, { time: v.currentTime, duration: d, at: Date.now() });
+  };
   v.addEventListener('timeupdate', () => { if (Math.abs(v.currentTime - last) >= 5) { last = v.currentTime; save(); } });
   v.addEventListener('pause', save);
 
@@ -806,7 +860,8 @@ function play(i, m, kind, startAt, audio = 0) {
   if (next) {
     let shown = false;
     v.addEventListener('timeupdate', () => {
-      if (shown || !v.duration || v.duration - v.currentTime > 60) return;
+      const d = totalDuration(p);
+      if (shown || !d || d - v.currentTime > 60) return;
       shown = true;
       $('stage').insertAdjacentHTML('beforeend', `<div class="next-up"><button class="btn btn-play" data-play="${next.id}">${ICON_PLAY}Next Episode</button></div>`);
       if (usingKeys) $('stage').querySelector('.next-up .btn').focus({ preventScroll: true });
@@ -830,6 +885,34 @@ function showPlayError(msg) {
   }
 }
 
+function updateOsd(curTime, totalDur) {
+  const p = player;
+  if (!p || !p.v) return;
+  const v = p.v;
+  const d = totalDur !== undefined ? totalDur : totalDuration(p);
+  const cur = curTime !== undefined ? curTime : (seekTarget !== null ? seekTarget : v.currentTime);
+  const fill = $('osdFill');
+  if (fill) fill.style.width = d > 0 ? `${Math.max(0, Math.min(100, (cur / d) * 100))}%` : '0';
+  const buf = $('osdBuf');
+  if (buf) {
+    let b = 0;
+    if (v.buffered && v.buffered.length) {
+      for (let j = 0; j < v.buffered.length; j++) {
+        if (v.buffered.start(j) <= cur && cur <= v.buffered.end(j)) {
+          b = v.buffered.end(j);
+          break;
+        }
+      }
+      if (!b) b = v.buffered.end(v.buffered.length - 1);
+    }
+    buf.style.width = d > 0 ? `${Math.max(0, Math.min(100, (b / d) * 100))}%` : '0';
+  }
+  const time = $('osdTime');
+  if (time) time.textContent = `${fmtClock(cur)} / ${fmtClock(d)}`;
+  const toggle = $('osdToggle');
+  if (toggle) toggle.textContent = v.paused ? '▶ Play' : '❚❚ Pause';
+}
+
 // HOMEFLIX's own player controls, for TV remotes (arrow buttons or a pointer like LG's Magic Remote).
 function attachOsd(p) {
   const { v, i, m, kind } = p;
@@ -838,28 +921,54 @@ function attachOsd(p) {
   v.controls = false;
   const top = $('stage').querySelector('.top-actions');
   if (top) top.remove(); // the controls have their own Audio and "Picture missing?" buttons
-  $('stage').insertAdjacentHTML('beforeend', osdHtml(i, m, kind, p.audio) +'<div class="osd-hint" id="osdHint">OK: pause · ◀ ▶: skip 10s · ▲ ▼: controls</div>');
-  const update = () => {
-    if (player !== p) return;
-    const d = v.duration || i.duration || 0;
-    $('osdFill').style.width = d ? `${(v.currentTime / d) * 100}%` : '0';
-    const b = v.buffered.length ? v.buffered.end(v.buffered.length - 1) : 0;
-    $('osdBuf').style.width = d ? `${Math.min(100, (b / d) * 100)}%` : '0';
-    $('osdTime').textContent = `${fmtClock(v.currentTime)} / ${fmtClock(d)}`;
-    $('osdToggle').textContent = v.paused ? '▶ Play' : '❚❚ Pause';
-  };
-  for (const ev of ['timeupdate', 'progress', 'play', 'pause', 'loadedmetadata']) v.addEventListener(ev, update);
-  update();
-  // Pointer remotes and mice: clicking the picture pauses, clicking the bar jumps to that point.
-  v.addEventListener('click', togglePlay);
-  $('osdBar').addEventListener('click', (e) => {
-    const r = e.currentTarget.getBoundingClientRect();
-    if (!v.duration || !r.width) return;
-    v.currentTime = Math.max(0, Math.min(v.duration - 1, ((e.clientX - r.left) / r.width) * v.duration));
-    showOsd();
+  $('stage').insertAdjacentHTML('beforeend', osdHtml(i, m, kind, p.audio) + '<div class="osd-hint" id="osdHint">OK: pause · ◀ ▶: skip 10s · ▲ ▼: controls</div>');
+  for (const ev of ['timeupdate', 'progress', 'play', 'pause', 'loadedmetadata', 'durationchange', 'seeking', 'seeked', 'canplay']) {
+    v.addEventListener(ev, () => updateOsd());
+  }
+  v.addEventListener('seeked', () => {
+    seekTarget = null;
+    updateOsd();
   });
+  updateOsd();
+  // Pointer remotes and mice: clicking the picture pauses, clicking or dragging the bar jumps to that point.
+  v.addEventListener('click', togglePlay);
+  const bar = $('osdBar');
+  if (bar) {
+    const handleBarSeek = (e) => {
+      const r = bar.getBoundingClientRect();
+      const d = totalDuration(p);
+      if (!d || !r.width) return;
+      const fraction = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+      const target = Math.max(0, Math.min(d - 1, fraction * d));
+      seekTarget = target;
+      try { v.currentTime = target; } catch {}
+      clearTimeout(seekClearTimer);
+      seekClearTimer = setTimeout(() => { seekTarget = null; }, 1000);
+      updateOsd(target, d);
+      showOsd();
+    };
+
+    let scrubbing = false;
+    bar.addEventListener('pointerdown', (e) => {
+      scrubbing = true;
+      try { bar.setPointerCapture(e.pointerId); } catch {}
+      handleBarSeek(e);
+    });
+    bar.addEventListener('pointermove', (e) => {
+      if (scrubbing) handleBarSeek(e);
+    });
+    const stopScrub = (e) => {
+      if (scrubbing) {
+        scrubbing = false;
+        try { bar.releasePointerCapture(e.pointerId); } catch {}
+        handleBarSeek(e);
+      }
+    };
+    bar.addEventListener('pointerup', stopScrub);
+    bar.addEventListener('pointercancel', stopScrub);
+  }
   showOsd();
-  if (usingKeys) $('osdToggle').focus({ preventScroll: true });
+  if (IS_TV && usingKeys) $('osdToggle').focus({ preventScroll: true });
 }
 
 // The controls fade out while playing; any key, pointer movement or click brings them back.
@@ -948,20 +1057,35 @@ function toggleBoost() {
   showOsd();
 }
 
+let seekTarget = null;
+let seekClearTimer = null;
+
 // Back to 0:00 and play.
 function startOver() {
   const v = $('v');
   if (!v) return;
-  v.currentTime = 0;
+  seekTarget = 0;
+  try { v.currentTime = 0; } catch {}
   v.play().catch(() => {});
+  updateOsd(0);
   showOsd();
 }
 
 function seek(by) {
-  const v = $('v');
-  if (!v) return;
-  const d = v.duration || Infinity;
-  v.currentTime = Math.max(0, Math.min(d - 1, v.currentTime + by));
+  const p = player;
+  if (!p || !p.v) return;
+  const v = p.v;
+  const d = totalDuration(p);
+  const maxTime = d > 1 ? d - 1 : (Number.isFinite(v.duration) && v.duration > 1 ? v.duration - 1 : Infinity);
+  const base = seekTarget !== null ? seekTarget : (Number.isFinite(v.currentTime) ? v.currentTime : 0);
+  const target = Math.max(0, Math.min(maxTime, base + by));
+  seekTarget = target;
+  try {
+    v.currentTime = target;
+  } catch {}
+  clearTimeout(seekClearTimer);
+  seekClearTimer = setTimeout(() => { seekTarget = null; }, 1000);
+  updateOsd(target, d);
   showOsd();
 }
 function togglePlay() {
@@ -1083,7 +1207,7 @@ function playerKey(k, e) {
     attachOsd(player);
     if (k === 'Left' || k === 'Right') seek(k === 'Left' ? -10 : 10);
     else if (k === 'Enter') togglePlay();
-    $('osdToggle').focus({ preventScroll: true });
+    if (IS_TV) $('osdToggle').focus({ preventScroll: true });
     return true;
   }
   const inControls = document.activeElement && document.activeElement !== document.body && document.activeElement.closest('#watch') && document.activeElement.tagName === 'BUTTON';
@@ -1091,7 +1215,14 @@ function playerKey(k, e) {
   switch (k) {
     case 'Left':
     case 'Right':
-      if (controlsShown && inControls) { moveFocus(k.toLowerCase()); showOsd(); return true; }
+      if (IS_TV && controlsShown && inControls) {
+        moveFocus(k.toLowerCase());
+        showOsd();
+        return true;
+      }
+      if (document.activeElement && document.activeElement.closest('#watch') && document.activeElement.tagName === 'BUTTON') {
+        document.activeElement.blur();
+      }
       if (e.target.tagName === 'VIDEO' && !(player && player.osd)) return false; // the browser's own controls seek
       seek(k === 'Left' ? -10 : 10);
       return true;
@@ -1107,7 +1238,6 @@ function playerKey(k, e) {
       togglePlay();
       return true;
     case 'Space':
-      if (inControls || e.target.tagName === 'VIDEO') return false;
       togglePlay();
       return true;
     case 'PlayPause': togglePlay(); return true;
@@ -1119,6 +1249,7 @@ function playerKey(k, e) {
   return false;
 }
 
+let lastArrowKeyTime = 0;
 document.addEventListener('keydown', (e) => {
   const k = keyName(e);
   if (!k) return;
@@ -1129,7 +1260,20 @@ document.addEventListener('keydown', (e) => {
     return;
   }
   if (['Left', 'Right', 'Up', 'Down'].includes(k)) usingKeys = true;
-  if ($('watch').classList.contains('on')) { if (playerKey(k, e)) e.preventDefault(); return; }
+  if ($('watch').classList.contains('on')) {
+    if (e.repeat && (k === 'Left' || k === 'Right')) {
+      const now = Date.now();
+      if (now - lastArrowKeyTime < 250) {
+        e.preventDefault();
+        return;
+      }
+      lastArrowKeyTime = now;
+    } else if (k === 'Left' || k === 'Right') {
+      lastArrowKeyTime = Date.now();
+    }
+    if (playerKey(k, e)) e.preventDefault();
+    return;
+  }
   if (typing && (k === 'Left' || k === 'Right' || k === 'Space')) return;
   if (['Left', 'Right', 'Up', 'Down'].includes(k)) { e.preventDefault(); moveFocus(k.toLowerCase()); return; }
   if (k === 'Enter' && document.activeElement && document.activeElement.matches('[tabindex="0"]:not(a)')) { e.preventDefault(); document.activeElement.click(); }
