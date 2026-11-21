@@ -40,11 +40,17 @@ function findSources() {
     } catch {
       fail('ffmpeg was not found on PATH. Install it with:\n  winget install Gyan.FFmpeg.Essentials\nthen open a new terminal and run this again.');
     }
-    const binDir = path.dirname(ffmpeg);
+    let binDir = path.dirname(ffmpeg);
+    // If installed via Chocolatey, the bin folder holds shims pointing to lib/ffmpeg/tools/...
+    const chocoBin = path.join(binDir, '..', 'lib', 'ffmpeg', 'tools', 'ffmpeg', 'bin');
+    if (fs.existsSync(path.join(chocoBin, 'ffmpeg.exe'))) {
+      binDir = chocoBin;
+      ffmpeg = path.join(chocoBin, 'ffmpeg.exe');
+    }
     return {
       ffmpeg,
       ffprobe: path.join(binDir, 'ffprobe.exe'),
-      license: [path.join(binDir, '..', 'LICENSE'), path.join(binDir, '..', 'LICENSE.txt')].find((f) => fs.existsSync(f)),
+      license: [path.join(binDir, '..', 'LICENSE'), path.join(binDir, '..', 'LICENSE.txt'), path.join(binDir, '..', 'doc', 'LICENSE.txt')].find((f) => fs.existsSync(f)),
       origin: 'Windows build and its configuration: https://www.gyan.dev/ffmpeg/builds/',
     };
   }
